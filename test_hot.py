@@ -94,14 +94,18 @@ with open(fname, "w") as f:
     print(f"Unblinded tx written to {fname}")
     f.write(unblinded)
 
-# blind using embit
-pset = PSET.from_string(unblinded)
-# rewind proofs to get blinding factors etc
-pset.unblind(mbk)
-# blind using some random seed
-pset.blind(b"1"*32)
+# # blind using embit
+# pset = PSET.from_string(unblinded)
+# # rewind proofs to get blinding factors etc
+# pset.unblind(mbk)
+# # blind using some random seed
+# pset.blind(b"1"*32)
 
-blinded = to_canonical_pset(str(pset))
+# blinded = to_canonical_pset(str(pset))
+
+# blind using Elements
+blinded = wallet.walletprocesspsbt(unblinded)["psbt"]
+pset = PSET.from_string(blinded)
 
 fname = f"{FNAME_PREFIX}_blinded.pset"
 with open(fname, "w") as f:

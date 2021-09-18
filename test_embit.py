@@ -70,14 +70,18 @@ with open(fname, "w") as f:
     print(f"Unblinded tx written to {fname}")
     f.write(unblinded)
 
-# blind using embit
-pset = PSET.from_string(unblinded)
-# rewind proofs to get blinding factors etc
-pset.unblind(mbk)
-# blind using some random seed
-pset.blind(b"1"*32)
+# # blind using embit
+# pset = PSET.from_string(unblinded)
+# # rewind proofs to get blinding factors etc
+# pset.unblind(mbk)
+# # blind using some random seed
+# pset.blind(b"1"*32)
 
-blinded = to_canonical_pset(str(pset))
+# blinded = to_canonical_pset(str(pset))
+
+# blind using Elements
+blinded = wallet.walletprocesspsbt(unblinded)["psbt"]
+pset = PSET.from_string(blinded)
 
 fname = f"{FNAME_PREFIX}_blinded.pset"
 with open(fname, "w") as f:
@@ -87,6 +91,7 @@ with open(fname, "w") as f:
 ############ Signing using embit ############
 
 pset.sign_with(root, sighash=(LSIGHASH.ALL | LSIGHASH.RANGEPROOF))
+signed_full = str(pset)
 signed = to_canonical_pset(str(pset))
 
 fname = f"{FNAME_PREFIX}_signed.pset"
@@ -94,10 +99,20 @@ with open(fname, "w") as f:
     print(f"Signed tx written to {fname}")
     f.write(signed)
 
+fname = f"{FNAME_PREFIX}_signed_full.pset"
+with open(fname, "w") as f:
+    print(f"Signed tx written to {fname}")
+    f.write(signed_full)
+
 ########## Trying to finalize and send ##############
 
 print("Trying to finalize via RPC")
-res = rpc.finalizepsbt(signed)
+# depends on the branch - master or elements-0.21 behave differently
+try:
+    res = rpc.finalizepsbt(signed)
+except:
+    res = rpc.finalizepsbt(signed_full)
+
 if (res["complete"]):
     print("Success! No complaints.")
     sys.exit()
