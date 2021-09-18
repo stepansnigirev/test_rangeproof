@@ -1,0 +1,151 @@
+import sys
+from embit import bip39, bip32
+from embit.liquid.descriptor import LDescriptor
+from embit.descriptor.checksum import add_checksum
+from embit.liquid import slip77
+from embit.liquid.networks import get_network
+from embit.liquid.pset import PSET, LSIGHASH
+from embit.liquid.finalizer import finalize_psbt
+
+from common import rpc, get_default_wallet, get_wallet_rpc, mine, to_canonical_pset
+
+WALLET_NAME = "test_hotwatch"
+WALLET_WITH_PRV = "test_hotprv"
+FNAME_PREFIX = "./data/hot_"
+PATH = "m/84h/1h/0h"
+
+######### Preparation ##############
+
+info = rpc.getblockchaininfo()
+# get correct network dict with all prefixes
+net = get_network(info["chain"])
+
+# will create default wallet if it's missing
+default_wallet = get_default_wallet()
+
+mnemonic = "ability "*11 + "acid"
+seed = bip39.mnemonic_to_seed(mnemonic)
+mbk = slip77.master_blinding_from_seed(seed)
+root = bip32.HDKey.from_seed(seed)
+prv = root.to_string(net["xprv"])
+# derive account and convert to tpub
+tpub = root.derive(PATH).to_public().to_string(net["xpub"])
+descriptor_key = f"[{root.my_fingerprint.hex()}{PATH[1:]}]{tpub}"
+
+wallet = get_wallet_rpc(WALLET_NAME)
+# Create wallet if it doesn't exist
+if WALLET_NAME not in rpc.listwallets():
+    # descriptor wallet
+    rpc.createwallet(WALLET_NAME, True, True, "", False, True)
+    args = [{
+        "desc": add_checksum(f"wpkh({descriptor_key}/{change}/*)"),
+        "internal": bool(change),
+        "timestamp": "now",
+        "watchonly": True,
+        "active": True,
+    } for change in [0, 1]]
+    res = wallet.importdescriptors(args)
+    assert all([r["success"] for r in res])
+    wallet.importmasterblindingkey(mbk.secret.hex())
+    print(f"Wallet {WALLET_NAME} created")
+
+# check blinding key is set correctly
+assert wallet.dumpmasterblindingkey() == mbk.secret.hex()
+
+walletprv = get_wallet_rpc(WALLET_WITH_PRV)
+# Create wallet with private keys if it doesn't exist
+if WALLET_WITH_PRV not in rpc.listwallets():
+    # descriptor wallet
+    rpc.createwallet(WALLET_WITH_PRV, False, True, "", False, True)
+    args = [{
+        "desc": add_checksum(f"wpkh({prv}{PATH[1:]}/{change}/*)"),
+        "internal": bool(change),
+        "timestamp": "now",
+        "watchonly": False,
+        "active": True,
+    } for change in [0, 1]]
+    res = walletprv.importdescriptors(args)
+    assert all([r["success"] for r in res])
+    walletprv.importmasterblindingkey(mbk.secret.hex())
+    print(f"Wallet {WALLET_WITH_PRV} created")
+
+# check blinding key is set correctly
+assert walletprv.dumpmasterblindingkey() == mbk.secret.hex()
+
+# fund wallet
+balance = wallet.getbalances()["mine"]["trusted"]["bitcoin"]
+if balance < 1:
+    addr = wallet.getnewaddress()
+    default_wallet.sendtoaddress(addr, 1)
+    mine(default_wallet, 1)
+balance = wallet.getbalances()["mine"]["trusted"]["bitcoin"]
+if balance < 1:
+    raise RuntimeError("Not enough funds")
+
+############ Creating PSBT ###########
+
+addr = default_wallet.getnewaddress()
+# walletcreatefundedpsbt estimates fee without taking into account rangeproofs,
+# so we need to set higher fees in this RPC call
+unblinded = wallet.walletcreatefundedpsbt([], [{addr: 0.1}], 0, {"fee_rate": 0.3})["psbt"]
+
+fname = f"{FNAME_PREFIX}_unblinded.pset"
+with open(fname, "w") as f:
+    print(f"Unblinded tx written to {fname}")
+    f.write(unblinded)
+
+# blind using embit
+pset = PSET.from_string(unblinded)
+# rewind proofs to get blinding factors etc
+pset.unblind(mbk)
+# blind using some random seed
+pset.blind(b"1"*32)
+
+blinded = to_canonical_pset(str(pset))
+
+fname = f"{FNAME_PREFIX}_blinded.pset"
+with open(fname, "w") as f:
+    print(f"Blinded tx written to {fname}")
+    f.write(blinded)
+
+########## Signing using Hot wallet ##########
+
+res = walletprv.walletprocesspsbt(blinded, True, "ALL|RANGEPROOF")
+signed = res.pop("psbt")
+pset = PSET.from_string(signed)
+if res["complete"]:
+    print("Hot wallet signed and completed PSET")
+
+fname = f"{FNAME_PREFIX}_signed.pset"
+with open(fname, "w") as f:
+    print(f"Signed tx written to {fname}")
+    f.write(signed)
+
+# ########## Trying to finalize and send ##############
+
+print("Trying to finalize via RPC")
+res = rpc.finalizepsbt(signed)
+if (res["complete"]):
+    print("Success! PSET signed with Elements is complete.")
+    tx = res["hex"]
+else:
+    print("Failed, finalizing manually")
+    signedpset = PSET.from_string(signed)
+    tx = str(finalize_psbt(signedpset))
+
+fname = f"{FNAME_PREFIX}_final.tx"
+with open(fname, "w") as f:
+    print(f"Finalized tx written to {fname}")
+    f.write(str(tx))
+
+print("Trying to broadcast signed PSBT")
+res = rpc.testmempoolaccept([str(tx)])[0]
+if "reject-reason" in res:
+    print("Transaction is rejected!", res["reject-reason"])
+    sys.exit()
+else:
+    print("Mempool accepts this transaction! Broadcasting...")
+txid = rpc.sendrawtransaction(str(tx))
+print(txid)
+mine(default_wallet, 1)
+
